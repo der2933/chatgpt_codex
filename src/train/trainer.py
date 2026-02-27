@@ -161,9 +161,10 @@ class QwenTrainer(Trainer):
                     allow_unused=True,
                 )
 
-                for (name, _), grad in zip(adapter_params, grads):
-                    if grad is None:
-                        continue
+                for (name, param), grad in zip(adapter_params, grads):
+                    grad_is_none = grad is None
+                    if grad_is_none:
+                        grad = torch.zeros_like(param, memory_format=torch.preserve_format)
                     grad_cpu = grad.detach().float().cpu()
                     record = {
                         "step": step,
@@ -180,6 +181,7 @@ class QwenTrainer(Trainer):
                         "grad_std": float(grad_cpu.std(unbiased=False).item()),
                         "grad_abs_mean": float(grad_cpu.abs().mean().item()),
                         "numel": int(grad_cpu.numel()),
+                        "grad_was_none": bool(grad_is_none),
                     }
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
