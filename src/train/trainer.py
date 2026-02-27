@@ -99,20 +99,57 @@ class QwenTrainer(Trainer):
 
     def _slice_example_from_inputs(self, inputs, example_idx: int):
         single_inputs = {}
+        batch_size = int(inputs["input_ids"].size(0))
+
+        image_counts = inputs.get("image_grid_counts")
+        video_counts = inputs.get("video_grid_counts")
+        image_prefix = None
+        video_prefix = None
+        if isinstance(image_counts, torch.Tensor) and image_counts.numel() == batch_size:
+            image_prefix = torch.nn.functional.pad(image_counts.to(dtype=torch.long).cumsum(dim=0), (1, 0), value=0)
+        if isinstance(video_counts, torch.Tensor) and video_counts.numel() == batch_size:
+            video_prefix = torch.nn.functional.pad(video_counts.to(dtype=torch.long).cumsum(dim=0), (1, 0), value=0)
+
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
-                if value.dim() > 0 and value.size(0) == inputs["input_ids"].size(0):
+                if value.dim() > 0 and value.size(0) == batch_size:
                     single_inputs[key] = value[example_idx : example_idx + 1]
                 else:
                     single_inputs[key] = value
             elif isinstance(value, list):
-                if len(value) == inputs["input_ids"].size(0):
+                if len(value) == batch_size:
                     single_inputs[key] = [value[example_idx]]
                 else:
                     single_inputs[key] = value
             else:
                 single_inputs[key] = value
+
+        if image_prefix is not None:
+            start = int(image_prefix[example_idx].item())
+            end = int(image_prefix[example_idx + 1].item())
+            if "pixel_values" in inputs:
+                single_inputs["pixel_values"] = inputs["pixel_values"][start:end]
+            if "image_grid_thw" in inputs:
+                single_inputs["image_grid_thw"] = inputs["image_grid_thw"][start:end]
+
+        if video_prefix is not None:
+            start = int(video_prefix[example_idx].item())
+            end = int(video_prefix[example_idx + 1].item())
+            if "pixel_values_videos" in inputs:
+                single_inputs["pixel_values_videos"] = inputs["pixel_values_videos"][start:end]
+            if "video_grid_thw" in inputs:
+                single_inputs["video_grid_thw"] = inputs["video_grid_thw"][start:end]
+            if "second_per_grid_ts" in inputs and isinstance(inputs["second_per_grid_ts"], list):
+                single_inputs["second_per_grid_ts"] = inputs["second_per_grid_ts"][start:end]
+
         return single_inputs
+
+    def _strip_auxiliary_inputs(self, inputs):
+        model_inputs = dict(inputs)
+        model_inputs.pop("modality_type", None)
+        model_inputs.pop("image_grid_counts", None)
+        model_inputs.pop("video_grid_counts", None)
+        return model_inputs
 
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
@@ -132,7 +169,7 @@ class QwenTrainer(Trainer):
         with open(self._grad_log_path, "a", encoding="utf-8") as f:
             for example_idx in range(n_examples):
                 single_inputs = self._slice_example_from_inputs(inputs, example_idx)
-                loss = self.compute_loss(model, single_inputs)
+                loss = self.compute_loss(model, self._strip_auxiliary_inputs(single_inputs))
                 grads = torch.autograd.grad(
                     loss,
                     [param for _, param in adapter_params],
@@ -169,7 +206,9 @@ class QwenTrainer(Trainer):
         if self._grad_logging_enabled:
             with torch.enable_grad():
                 self._log_example_level_gradients(model, inputs)
-        return super().training_step(model, inputs, *args, **kwargs)
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        return super().training_step(model, model_inputs, *args, **kwargs)
 
     def create_optimizer(self):
         """
