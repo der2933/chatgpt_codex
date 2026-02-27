@@ -50,6 +50,8 @@ class QwenTrainer(Trainer):
         grad_log_path = getattr(self.args, "gradient_log_path", None)
         self._grad_log_path = grad_log_path or os.path.join(self.args.output_dir, "gradient_logs.jsonl")
         self._adapter_grad_params = None
+        self._all_trainable_grad_params = None
+        self._adapter_grad_indices = None
 
     def _is_transformer_block_adapter_param(self, name: str) -> bool:
         if "model.layers." not in name:
@@ -88,6 +90,29 @@ class QwenTrainer(Trainer):
                 f"Gradient logging enabled. Tracking {len(self._adapter_grad_params)} transformer-block adapter parameters."
             )
         return self._adapter_grad_params
+
+    def _get_all_trainable_grad_params(self):
+        if self._all_trainable_grad_params is not None:
+            return self._all_trainable_grad_params
+        self._all_trainable_grad_params = [
+            (name, param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+        return self._all_trainable_grad_params
+
+    def _get_adapter_grad_indices(self):
+        if self._adapter_grad_indices is not None:
+            return self._adapter_grad_indices
+
+        all_params = self._get_all_trainable_grad_params()
+        adapter_param_ids = {id(param) for _, param in self._get_adapter_grad_params()}
+        self._adapter_grad_indices = [
+            idx
+            for idx, (_, param) in enumerate(all_params)
+            if id(param) in adapter_param_ids
+        ]
+        return self._adapter_grad_indices
 
     def _should_log_gradients(self) -> bool:
         if not self._grad_logging_enabled:
@@ -135,8 +160,9 @@ class QwenTrainer(Trainer):
         if not self._should_log_gradients():
             return
 
-        adapter_params = self._get_adapter_grad_params()
-        if len(adapter_params) == 0:
+        all_trainable_params = self._get_all_trainable_grad_params()
+        adapter_grad_indices = self._get_adapter_grad_indices()
+        if len(adapter_grad_indices) == 0:
             return
 
         step = int(self.state.global_step + 1)
@@ -153,15 +179,17 @@ class QwenTrainer(Trainer):
 
             for grad_partition, partition_inputs, supervised_token_count in self._build_partitioned_inputs(inputs):
                 loss = self.compute_loss(model, self._strip_auxiliary_inputs(partition_inputs))
-                grads = torch.autograd.grad(
+                all_grads = torch.autograd.grad(
                     loss,
-                    [param for _, param in adapter_params],
+                    [param for _, param in all_trainable_params],
                     retain_graph=False,
                     create_graph=False,
                     allow_unused=True,
                 )
 
-                for (name, param), grad in zip(adapter_params, grads):
+                for grad_idx in adapter_grad_indices:
+                    name, param = all_trainable_params[grad_idx]
+                    grad = all_grads[grad_idx]
                     grad_is_none = grad is None
                     if grad_is_none:
                         grad = torch.zeros_like(param, memory_format=torch.preserve_format)
