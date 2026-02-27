@@ -151,6 +151,33 @@ class QwenTrainer(Trainer):
         model_inputs.pop("video_grid_counts", None)
         return model_inputs
 
+    def _build_partitioned_inputs(self, single_inputs):
+        labels = single_inputs.get("labels")
+        token_modality_type = single_inputs.get("token_modality_type")
+        if not isinstance(labels, torch.Tensor) or not isinstance(token_modality_type, torch.Tensor):
+            return [("all", single_inputs, None)]
+
+        ignore_index = -100
+        if self.label_smoother is not None and hasattr(self.label_smoother, "ignore_index"):
+            ignore_index = self.label_smoother.ignore_index
+
+        supervised_mask = labels.ne(ignore_index)
+        image_mask = supervised_mask & token_modality_type.eq(1)
+        text_mask = supervised_mask & token_modality_type.ne(1)
+
+        partitions = [("all", single_inputs, int(supervised_mask.sum().item()))]
+        for partition_name, partition_mask in (("image_only", image_mask), ("text_only", text_mask)):
+            token_count = int(partition_mask.sum().item())
+            if token_count == 0:
+                continue
+            partition_inputs = dict(single_inputs)
+            partition_labels = labels.clone()
+            partition_labels[~partition_mask] = ignore_index
+            partition_inputs["labels"] = partition_labels
+            partitions.append((partition_name, partition_inputs, token_count))
+
+        return partitions
+
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
             return
@@ -169,38 +196,42 @@ class QwenTrainer(Trainer):
         with open(self._grad_log_path, "a", encoding="utf-8") as f:
             for example_idx in range(n_examples):
                 single_inputs = self._slice_example_from_inputs(inputs, example_idx)
-                loss = self.compute_loss(model, self._strip_auxiliary_inputs(single_inputs))
-                grads = torch.autograd.grad(
-                    loss,
-                    [param for _, param in adapter_params],
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
 
-                modality_id = int(single_inputs.get("modality_type", torch.tensor([0], device=loss.device))[0].item())
+                modality_id = int(single_inputs.get("modality_type", torch.tensor([0]))[0].item())
                 modality_map = {0: "text_only", 1: "image_text", 2: "video_text"}
                 modality_type = modality_map.get(modality_id, "unknown")
 
-                for (name, _), grad in zip(adapter_params, grads):
-                    if grad is None:
-                        continue
-                    grad_cpu = grad.detach().float().cpu()
-                    record = {
-                        "step": step,
-                        "example_index": int(example_idx),
-                        "modality_id": modality_id,
-                        "modality_type": modality_type,
-                        "adapter_type": self._extract_adapter_type(name),
-                        "param_name": name,
-                        "layer_depth": self._extract_layer_depth(name),
-                        "grad_norm": float(grad_cpu.norm(p=2).item()),
-                        "grad_mean": float(grad_cpu.mean().item()),
-                        "grad_std": float(grad_cpu.std(unbiased=False).item()),
-                        "grad_abs_mean": float(grad_cpu.abs().mean().item()),
-                        "numel": int(grad_cpu.numel()),
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for grad_partition, partition_inputs, supervised_token_count in self._build_partitioned_inputs(single_inputs):
+                    loss = self.compute_loss(model, self._strip_auxiliary_inputs(partition_inputs))
+                    grads = torch.autograd.grad(
+                        loss,
+                        [param for _, param in adapter_params],
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+
+                    for (name, _), grad in zip(adapter_params, grads):
+                        if grad is None:
+                            continue
+                        grad_cpu = grad.detach().float().cpu()
+                        record = {
+                            "step": step,
+                            "example_index": int(example_idx),
+                            "modality_id": modality_id,
+                            "modality_type": modality_type,
+                            "grad_partition": grad_partition,
+                            "supervised_token_count": supervised_token_count,
+                            "adapter_type": self._extract_adapter_type(name),
+                            "param_name": name,
+                            "layer_depth": self._extract_layer_depth(name),
+                            "grad_norm": float(grad_cpu.norm(p=2).item()),
+                            "grad_mean": float(grad_cpu.mean().item()),
+                            "grad_std": float(grad_cpu.std(unbiased=False).item()),
+                            "grad_abs_mean": float(grad_cpu.abs().mean().item()),
+                            "numel": int(grad_cpu.numel()),
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def training_step(self, model, inputs, *args, **kwargs):
         if self._grad_logging_enabled:
