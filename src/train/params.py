@@ -59,6 +59,22 @@ class TrainingArguments(HFTrainingArguments):
     num_lora_modules: int = -1
     use_liger: bool = True
     do_final_eval: bool = False
+    enable_gradient_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable example-level gradient logging for transformer block adapters."},
+    )
+    gradient_log_every_n_steps: int = field(
+        default=50,
+        metadata={"help": "Log gradients every N training steps."},
+    )
+    gradient_log_max_examples_per_step: int = field(
+        default=1,
+        metadata={"help": "Maximum number of examples logged per selected step."},
+    )
+    gradient_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write gradient jsonl records. Defaults to output_dir/gradient_logs.jsonl."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

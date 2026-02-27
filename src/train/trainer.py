@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import torch
 import torch.nn as nn
 
@@ -38,9 +39,137 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     return param
 
 
+
+
 class QwenTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super(QwenTrainer, self).__init__(*args, **kwargs)
+        self._grad_logging_enabled = bool(getattr(self.args, "enable_gradient_logging", False))
+        self._grad_log_every_n_steps = max(1, int(getattr(self.args, "gradient_log_every_n_steps", 50)))
+        self._grad_log_max_examples_per_step = max(1, int(getattr(self.args, "gradient_log_max_examples_per_step", 1)))
+        grad_log_path = getattr(self.args, "gradient_log_path", None)
+        self._grad_log_path = grad_log_path or os.path.join(self.args.output_dir, "gradient_logs.jsonl")
+        self._adapter_grad_params = None
+
+    def _is_transformer_block_adapter_param(self, name: str) -> bool:
+        if "model.layers." not in name:
+            return False
+        adapter_keywords = ("custom_lora", "lora_", "adapter", "kradapter")
+        return any(keyword in name.lower() for keyword in adapter_keywords)
+
+    def _extract_layer_depth(self, name: str) -> int:
+        match = re.search(r"model\.layers\.(\d+)", name)
+        return int(match.group(1)) if match else -1
+
+    def _extract_adapter_type(self, name: str) -> str:
+        lower_name = name.lower()
+        if "custom_lora" in lower_name:
+            return "custom_lora"
+        if "kradapter" in lower_name:
+            return "kradapter"
+        if "lora_a" in lower_name:
+            return "lora_A"
+        if "lora_b" in lower_name:
+            return "lora_B"
+        if "adapter" in lower_name:
+            return "adapter"
+        return "other"
+
+    def _get_adapter_grad_params(self):
+        if self._adapter_grad_params is not None:
+            return self._adapter_grad_params
+        self._adapter_grad_params = [
+            (name, param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and self._is_transformer_block_adapter_param(name)
+        ]
+        if self._grad_logging_enabled and self.is_world_process_zero():
+            logger.info(
+                f"Gradient logging enabled. Tracking {len(self._adapter_grad_params)} transformer-block adapter parameters."
+            )
+        return self._adapter_grad_params
+
+    def _should_log_gradients(self) -> bool:
+        if not self._grad_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._grad_log_every_n_steps == 0
+
+    def _slice_example_from_inputs(self, inputs, example_idx: int):
+        single_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.dim() > 0 and value.size(0) == inputs["input_ids"].size(0):
+                    single_inputs[key] = value[example_idx : example_idx + 1]
+                else:
+                    single_inputs[key] = value
+            elif isinstance(value, list):
+                if len(value) == inputs["input_ids"].size(0):
+                    single_inputs[key] = [value[example_idx]]
+                else:
+                    single_inputs[key] = value
+            else:
+                single_inputs[key] = value
+        return single_inputs
+
+    def _log_example_level_gradients(self, model, inputs):
+        if not self._should_log_gradients():
+            return
+
+        adapter_params = self._get_adapter_grad_params()
+        if len(adapter_params) == 0:
+            return
+
+        batch_size = int(inputs["input_ids"].size(0))
+        n_examples = min(batch_size, self._grad_log_max_examples_per_step)
+        step = int(self.state.global_step + 1)
+
+        grad_log_dir = os.path.dirname(self._grad_log_path)
+        if grad_log_dir:
+            os.makedirs(grad_log_dir, exist_ok=True)
+        with open(self._grad_log_path, "a", encoding="utf-8") as f:
+            for example_idx in range(n_examples):
+                single_inputs = self._slice_example_from_inputs(inputs, example_idx)
+                loss = self.compute_loss(model, single_inputs)
+                grads = torch.autograd.grad(
+                    loss,
+                    [param for _, param in adapter_params],
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+                modality_id = int(single_inputs.get("modality_type", torch.tensor([0], device=loss.device))[0].item())
+                modality_map = {0: "text_only", 1: "image_text", 2: "video_text"}
+                modality_type = modality_map.get(modality_id, "unknown")
+
+                for (name, _), grad in zip(adapter_params, grads):
+                    if grad is None:
+                        continue
+                    grad_cpu = grad.detach().float().cpu()
+                    record = {
+                        "step": step,
+                        "example_index": int(example_idx),
+                        "modality_id": modality_id,
+                        "modality_type": modality_type,
+                        "adapter_type": self._extract_adapter_type(name),
+                        "param_name": name,
+                        "layer_depth": self._extract_layer_depth(name),
+                        "grad_norm": float(grad_cpu.norm(p=2).item()),
+                        "grad_mean": float(grad_cpu.mean().item()),
+                        "grad_std": float(grad_cpu.std(unbiased=False).item()),
+                        "grad_abs_mean": float(grad_cpu.abs().mean().item()),
+                        "numel": int(grad_cpu.numel()),
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        if self._grad_logging_enabled:
+            with torch.enable_grad():
+                self._log_example_level_gradients(model, inputs)
+        return super().training_step(model, inputs, *args, **kwargs)
 
     def create_optimizer(self):
         """
