@@ -154,15 +154,47 @@ class QwenTrainer(Trainer):
             "mix_type": mix_type,
         }
 
+    def _get_ignore_index(self) -> int:
+        if self.label_smoother is not None and hasattr(self.label_smoother, "ignore_index"):
+            return int(self.label_smoother.ignore_index)
+        return -100
+
+    def _summarize_supervised_tokens(self, inputs):
+        labels = inputs.get("labels")
+        token_modality_type = inputs.get("token_modality_type")
+        if not isinstance(labels, torch.Tensor) or not isinstance(token_modality_type, torch.Tensor):
+            return {
+                "total_supervised_tokens": None,
+                "text_supervised_tokens": None,
+                "image_supervised_tokens": None,
+                "text_token_ratio": None,
+                "image_token_ratio": None,
+            }
+
+        ignore_index = self._get_ignore_index()
+        supervised_mask = labels.ne(ignore_index)
+        image_mask = supervised_mask & token_modality_type.eq(1)
+        text_mask = supervised_mask & token_modality_type.ne(1)
+
+        total_tokens = int(supervised_mask.sum().item())
+        text_tokens = int(text_mask.sum().item())
+        image_tokens = int(image_mask.sum().item())
+        denom = max(1, total_tokens)
+        return {
+            "total_supervised_tokens": total_tokens,
+            "text_supervised_tokens": text_tokens,
+            "image_supervised_tokens": image_tokens,
+            "text_token_ratio": float(text_tokens / denom),
+            "image_token_ratio": float(image_tokens / denom),
+        }
+
     def _build_partitioned_inputs(self, single_inputs):
         labels = single_inputs.get("labels")
         token_modality_type = single_inputs.get("token_modality_type")
         if not isinstance(labels, torch.Tensor) or not isinstance(token_modality_type, torch.Tensor):
             return [("all", single_inputs, None)]
 
-        ignore_index = -100
-        if self.label_smoother is not None and hasattr(self.label_smoother, "ignore_index"):
-            ignore_index = self.label_smoother.ignore_index
+        ignore_index = self._get_ignore_index()
 
         supervised_mask = labels.ne(ignore_index)
         image_mask = supervised_mask & token_modality_type.eq(1)
@@ -202,6 +234,7 @@ class QwenTrainer(Trainer):
             else:
                 modality_ids = []
             batch_modality_summary = self._summarize_batch_modalities(modality_ids)
+            token_summary = self._summarize_supervised_tokens(inputs)
 
             for grad_partition, partition_inputs, supervised_token_count in self._build_partitioned_inputs(inputs):
                 loss = self.compute_loss(model, self._strip_auxiliary_inputs(partition_inputs))
@@ -233,10 +266,25 @@ class QwenTrainer(Trainer):
                         "batch_video_examples": int(batch_modality_summary["video_examples"]),
                         "grad_partition": grad_partition,
                         "supervised_token_count": supervised_token_count,
+                        "total_supervised_tokens": token_summary["total_supervised_tokens"],
+                        "text_supervised_tokens": token_summary["text_supervised_tokens"],
+                        "image_supervised_tokens": token_summary["image_supervised_tokens"],
+                        "text_token_ratio": token_summary["text_token_ratio"],
+                        "image_token_ratio": token_summary["image_token_ratio"],
+                        "partition_token_ratio": (
+                            float(supervised_token_count / max(1, token_summary["total_supervised_tokens"]))
+                            if supervised_token_count is not None and token_summary["total_supervised_tokens"] is not None
+                            else None
+                        ),
                         "adapter_type": self._extract_adapter_type(name),
                         "param_name": name,
                         "layer_depth": self._extract_layer_depth(name),
                         "grad_norm": float(grad_cpu.norm(p=2).item()),
+                        "grad_norm_per_token": (
+                            float(grad_cpu.norm(p=2).item() / max(1, supervised_token_count))
+                            if supervised_token_count is not None
+                            else None
+                        ),
                         "grad_mean": float(grad_cpu.mean().item()),
                         "grad_std": float(grad_cpu.std(unbiased=False).item()),
                         "grad_abs_mean": float(grad_cpu.abs().mean().item()),
