@@ -87,6 +87,26 @@ class TrainingArguments(HFTrainingArguments):
         default=None,
         metadata={"help": "Directory to store dumped full gradient vectors (.npy). Defaults to output_dir/gradient_vectors."},
     )
+    enable_hidden_state_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable token hidden-state logging by layer for modality-space analysis."},
+    )
+    hidden_state_log_every_n_steps: int = field(
+        default=200,
+        metadata={"help": "Log token hidden states every N training steps."},
+    )
+    hidden_state_log_max_tokens_per_modality: int = field(
+        default=64,
+        metadata={"help": "Maximum sampled tokens per modality (text/image) per layer when hidden-state logging is enabled."},
+    )
+    hidden_state_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write hidden-state jsonl records. Defaults to output_dir/hidden_state_logs.jsonl."},
+    )
+    hidden_state_vector_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store hidden-state token vectors (.npy). Defaults to output_dir/hidden_state_vectors."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

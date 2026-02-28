@@ -59,6 +59,14 @@ class QwenTrainer(Trainer):
         full_grad_dir = getattr(self.args, "gradient_log_full_grad_dir", None)
         self._grad_log_full_grad_dir = full_grad_dir or os.path.join(self.args.output_dir, "gradient_vectors")
 
+        self._hidden_state_logging_enabled = bool(getattr(self.args, "enable_hidden_state_logging", False))
+        self._hidden_state_log_every_n_steps = max(1, int(getattr(self.args, "hidden_state_log_every_n_steps", 200)))
+        self._hidden_state_log_max_tokens_per_modality = max(1, int(getattr(self.args, "hidden_state_log_max_tokens_per_modality", 64)))
+        hidden_state_log_path = getattr(self.args, "hidden_state_log_path", None)
+        self._hidden_state_log_path = hidden_state_log_path or os.path.join(self.args.output_dir, "hidden_state_logs.jsonl")
+        hidden_state_vector_dir = getattr(self.args, "hidden_state_vector_dir", None)
+        self._hidden_state_vector_dir = hidden_state_vector_dir or os.path.join(self.args.output_dir, "hidden_state_vectors")
+
     def _is_transformer_block_adapter_param(self, name: str) -> bool:
         if "model.layers." not in name:
             return False
@@ -221,6 +229,83 @@ class QwenTrainer(Trainer):
         np.save(path, grad_cpu.numpy())
         return path
 
+    def _should_log_hidden_states(self) -> bool:
+        if not self._hidden_state_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._hidden_state_log_every_n_steps == 0
+
+    def _dump_hidden_vectors(self, step, layer_depth, modality, vectors):
+        os.makedirs(self._hidden_state_vector_dir, exist_ok=True)
+        file_name = f"step{step:08d}_layer{layer_depth:03d}_{modality}.npy"
+        path = os.path.join(self._hidden_state_vector_dir, file_name)
+        np.save(path, vectors)
+        return path
+
+    def _log_token_hidden_states(self, model, inputs):
+        if not self._should_log_hidden_states():
+            return
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        if "token_modality_type" not in model_inputs or "labels" not in model_inputs:
+            return
+
+        hs_log_dir = os.path.dirname(self._hidden_state_log_path)
+        if hs_log_dir:
+            os.makedirs(hs_log_dir, exist_ok=True)
+
+        step = int(self.state.global_step + 1)
+        ignore_index = self._get_ignore_index()
+
+        with torch.no_grad():
+            outputs = model(
+                **model_inputs,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            return
+
+        labels = model_inputs["labels"]
+        token_modality_type = model_inputs["token_modality_type"]
+        supervised_mask = labels.ne(ignore_index)
+        image_mask = supervised_mask & token_modality_type.eq(1)
+        text_mask = supervised_mask & token_modality_type.ne(1)
+
+        with open(self._hidden_state_log_path, "a", encoding="utf-8") as f:
+            for layer_idx, layer_hidden in enumerate(hidden_states[1:]):
+                layer_depth = layer_idx
+                layer_hidden = layer_hidden.detach().float().cpu()
+                image_vectors = layer_hidden[image_mask]
+                text_vectors = layer_hidden[text_mask]
+
+                for modality, vectors in (("image", image_vectors), ("text", text_vectors)):
+                    if vectors.numel() == 0:
+                        continue
+
+                    if vectors.size(0) > self._hidden_state_log_max_tokens_per_modality:
+                        sample_idx = torch.randperm(vectors.size(0))[: self._hidden_state_log_max_tokens_per_modality]
+                        vectors = vectors[sample_idx]
+
+                    vectors_np = vectors.numpy()
+                    vec_path = self._dump_hidden_vectors(step, layer_depth, modality, vectors_np)
+                    norms = np.linalg.norm(vectors_np, axis=1)
+                    record = {
+                        "step": step,
+                        "layer_depth": int(layer_depth),
+                        "modality": modality,
+                        "token_count": int(vectors_np.shape[0]),
+                        "hidden_dim": int(vectors_np.shape[1]),
+                        "hidden_path": vec_path,
+                        "hidden_norm_mean": float(norms.mean()),
+                        "hidden_norm_std": float(norms.std()),
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
             return
@@ -311,6 +396,9 @@ class QwenTrainer(Trainer):
         if self._grad_logging_enabled:
             with torch.enable_grad():
                 self._log_example_level_gradients(model, inputs)
+
+        if self._hidden_state_logging_enabled:
+            self._log_token_hidden_states(model, inputs)
 
         model_inputs = self._strip_auxiliary_inputs(inputs)
         return super().training_step(model, model_inputs, *args, **kwargs)
