@@ -75,6 +75,18 @@ class TrainingArguments(HFTrainingArguments):
         default=None,
         metadata={"help": "Path to write gradient jsonl records. Defaults to output_dir/gradient_logs.jsonl."},
     )
+    gradient_log_save_full_grad: bool = field(
+        default=False,
+        metadata={"help": "Whether to dump full gradient vectors to .npy files for selected adapter parameters."},
+    )
+    gradient_log_full_grad_max_params: int = field(
+        default=8,
+        metadata={"help": "Maximum number of adapter parameters per partition/step to dump full gradient vectors for. <=0 means all."},
+    )
+    gradient_log_full_grad_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store dumped full gradient vectors (.npy). Defaults to output_dir/gradient_vectors."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

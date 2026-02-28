@@ -1,3 +1,4 @@
+import hashlib
 import json
 import numpy as np
 import os
@@ -53,6 +54,10 @@ class QwenTrainer(Trainer):
         self._adapter_grad_params = None
         self._all_trainable_grad_params = None
         self._adapter_grad_indices = None
+        self._grad_log_save_full_grad = bool(getattr(self.args, "gradient_log_save_full_grad", False))
+        self._grad_log_full_grad_max_params = int(getattr(self.args, "gradient_log_full_grad_max_params", 8))
+        full_grad_dir = getattr(self.args, "gradient_log_full_grad_dir", None)
+        self._grad_log_full_grad_dir = full_grad_dir or os.path.join(self.args.output_dir, "gradient_vectors")
 
     def _is_transformer_block_adapter_param(self, name: str) -> bool:
         if "model.layers." not in name:
@@ -213,6 +218,33 @@ class QwenTrainer(Trainer):
 
         return partitions
 
+    def _select_full_grad_dump_indices(self, adapter_grad_indices, all_trainable_params, all_grads):
+        if not self._grad_log_save_full_grad or len(adapter_grad_indices) == 0:
+            return set()
+
+        scored = []
+        for grad_idx in adapter_grad_indices:
+            _, param = all_trainable_params[grad_idx]
+            grad = all_grads[grad_idx]
+            if grad is None:
+                norm_val = 0.0
+            else:
+                norm_val = float(grad.detach().float().norm(p=2).item())
+            scored.append((norm_val, grad_idx))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if self._grad_log_full_grad_max_params <= 0:
+            return {idx for _, idx in scored}
+        return {idx for _, idx in scored[: self._grad_log_full_grad_max_params]}
+
+    def _dump_full_grad_vector(self, step, grad_partition, param_name, grad_cpu):
+        os.makedirs(self._grad_log_full_grad_dir, exist_ok=True)
+        safe_name = hashlib.md5(param_name.encode("utf-8")).hexdigest()[:16]
+        filename = f"step{step:08d}_{grad_partition}_{safe_name}.npy"
+        path = os.path.join(self._grad_log_full_grad_dir, filename)
+        np.save(path, grad_cpu.numpy())
+        return path
+
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
             return
@@ -244,6 +276,11 @@ class QwenTrainer(Trainer):
                     retain_graph=False,
                     create_graph=False,
                     allow_unused=True,
+                )
+                full_grad_dump_indices = self._select_full_grad_dump_indices(
+                    adapter_grad_indices,
+                    all_trainable_params,
+                    all_grads,
                 )
 
                 for grad_idx in adapter_grad_indices:
@@ -290,7 +327,15 @@ class QwenTrainer(Trainer):
                         "grad_abs_mean": float(grad_cpu.abs().mean().item()),
                         "numel": int(grad_cpu.numel()),
                         "grad_was_none": bool(grad_is_none),
+                        "grad_path": None,
                     }
+                    if grad_idx in full_grad_dump_indices:
+                        record["grad_path"] = self._dump_full_grad_vector(
+                            step,
+                            grad_partition,
+                            name,
+                            grad_cpu,
+                        )
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def training_step(self, model, inputs, *args, **kwargs):
