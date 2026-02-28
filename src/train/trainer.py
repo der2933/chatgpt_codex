@@ -177,31 +177,6 @@ class QwenTrainer(Trainer):
             "image_token_ratio": float(image_tokens / denom),
         }
 
-    def _build_partitioned_inputs(self, single_inputs):
-        labels = single_inputs.get("labels")
-        token_modality_type = single_inputs.get("token_modality_type")
-        if not isinstance(labels, torch.Tensor) or not isinstance(token_modality_type, torch.Tensor):
-            return [("all", single_inputs, None)]
-
-        ignore_index = self._get_ignore_index()
-
-        supervised_mask = labels.ne(ignore_index)
-        image_mask = supervised_mask & token_modality_type.eq(1)
-        text_mask = supervised_mask & token_modality_type.ne(1)
-
-        partitions = [("all", single_inputs, int(supervised_mask.sum().item()))]
-        for partition_name, partition_mask in (("image_only", image_mask), ("text_only", text_mask)):
-            token_count = int(partition_mask.sum().item())
-            if token_count == 0:
-                continue
-            partition_inputs = dict(single_inputs)
-            partition_labels = labels.clone()
-            partition_labels[~partition_mask] = ignore_index
-            partition_inputs["labels"] = partition_labels
-            partitions.append((partition_name, partition_inputs, token_count))
-
-        return partitions
-
     def _select_full_grad_dump_indices(self, adapter_grad_indices, all_trainable_params, all_grads):
         if not self._grad_log_save_full_grad or len(adapter_grad_indices) == 0:
             return set()
@@ -237,11 +212,11 @@ class QwenTrainer(Trainer):
         next_step = self.state.global_step + 1
         return next_step % self._hidden_state_log_every_n_steps == 0
 
-    def _dump_hidden_vectors(self, step, layer_depth, modality, vectors):
+    def _dump_hidden_vectors(self, step, layer_depth, sample_idx, modality, vector):
         os.makedirs(self._hidden_state_vector_dir, exist_ok=True)
-        file_name = f"step{step:08d}_layer{layer_depth:03d}_{modality}.npy"
+        file_name = f"step{step:08d}_layer{layer_depth:03d}_sample{sample_idx:04d}_{modality}.npy"
         path = os.path.join(self._hidden_state_vector_dir, file_name)
-        np.save(path, vectors)
+        np.save(path, vector)
         return path
 
     def _log_token_hidden_states(self, model, inputs):
@@ -273,38 +248,47 @@ class QwenTrainer(Trainer):
         labels = model_inputs["labels"]
         token_modality_type = model_inputs["token_modality_type"]
         supervised_mask = labels.ne(ignore_index)
-        image_mask = supervised_mask & token_modality_type.eq(1)
-        text_mask = supervised_mask & token_modality_type.ne(1)
+        modality_ids = model_inputs.get("modality_type")
 
+        batch_size = int(labels.size(0))
         with open(self._hidden_state_log_path, "a", encoding="utf-8") as f:
             for layer_idx, layer_hidden in enumerate(hidden_states[1:]):
                 layer_depth = layer_idx
                 layer_hidden = layer_hidden.detach().float().cpu()
-                image_vectors = layer_hidden[image_mask]
-                text_vectors = layer_hidden[text_mask]
 
-                for modality, vectors in (("image", image_vectors), ("text", text_vectors)):
-                    if vectors.numel() == 0:
-                        continue
+                for sample_idx in range(batch_size):
+                    sample_hidden = layer_hidden[sample_idx]
+                    sample_supervised = supervised_mask[sample_idx]
+                    sample_token_modality = token_modality_type[sample_idx]
 
-                    if vectors.size(0) > self._hidden_state_log_max_tokens_per_modality:
-                        sample_idx = torch.randperm(vectors.size(0))[: self._hidden_state_log_max_tokens_per_modality]
-                        vectors = vectors[sample_idx]
+                    sample_image_mask = sample_supervised & sample_token_modality.eq(1)
+                    sample_text_mask = sample_supervised & sample_token_modality.ne(1)
 
-                    vectors_np = vectors.numpy()
-                    vec_path = self._dump_hidden_vectors(step, layer_depth, modality, vectors_np)
-                    norms = np.linalg.norm(vectors_np, axis=1)
-                    record = {
-                        "step": step,
-                        "layer_depth": int(layer_depth),
-                        "modality": modality,
-                        "token_count": int(vectors_np.shape[0]),
-                        "hidden_dim": int(vectors_np.shape[1]),
-                        "hidden_path": vec_path,
-                        "hidden_norm_mean": float(norms.mean()),
-                        "hidden_norm_std": float(norms.std()),
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    for modality, mask in (("image", sample_image_mask), ("text", sample_text_mask)):
+                        token_count = int(mask.sum().item())
+                        if token_count == 0:
+                            continue
+
+                        vectors = sample_hidden[mask]
+                        mean_vector = vectors.mean(dim=0)
+                        vec_np = mean_vector.numpy()
+                        vec_path = self._dump_hidden_vectors(step, layer_depth, sample_idx, modality, vec_np)
+                        record = {
+                            "step": step,
+                            "layer_depth": int(layer_depth),
+                            "sample_index": int(sample_idx),
+                            "sample_modality_type": (
+                                int(modality_ids[sample_idx].item())
+                                if isinstance(modality_ids, torch.Tensor)
+                                else None
+                            ),
+                            "modality": modality,
+                            "token_count": token_count,
+                            "hidden_dim": int(vec_np.shape[0]),
+                            "hidden_path": vec_path,
+                            "hidden_norm": float(np.linalg.norm(vec_np)),
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
@@ -328,69 +312,65 @@ class QwenTrainer(Trainer):
                 modality_ids = []
             token_summary = self._summarize_supervised_tokens(inputs)
 
-            for grad_partition, partition_inputs, supervised_token_count in self._build_partitioned_inputs(inputs):
-                loss = self.compute_loss(model, self._strip_auxiliary_inputs(partition_inputs))
-                all_grads = torch.autograd.grad(
-                    loss,
-                    [param for _, param in all_trainable_params],
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-                full_grad_dump_indices = self._select_full_grad_dump_indices(
-                    adapter_grad_indices,
-                    all_trainable_params,
-                    all_grads,
-                )
+            supervised_token_count = token_summary["total_supervised_tokens"]
+            loss = self.compute_loss(model, self._strip_auxiliary_inputs(inputs))
+            all_grads = torch.autograd.grad(
+                loss,
+                [param for _, param in all_trainable_params],
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            full_grad_dump_indices = self._select_full_grad_dump_indices(
+                adapter_grad_indices,
+                all_trainable_params,
+                all_grads,
+            )
 
-                for grad_idx in adapter_grad_indices:
-                    name, param = all_trainable_params[grad_idx]
-                    grad = all_grads[grad_idx]
-                    grad_is_none = grad is None
-                    if grad_is_none:
-                        grad = torch.zeros_like(param, memory_format=torch.preserve_format)
-                    grad_cpu = grad.detach().float().cpu()
-                    record = {
-                        "step": step,
-                        "example_index": -1,
-                        "modality_ids": modality_ids,
-                        "modality_type": "batch",
-                        "grad_partition": grad_partition,
-                        "supervised_token_count": supervised_token_count,
-                        "total_supervised_tokens": token_summary["total_supervised_tokens"],
-                        "text_supervised_tokens": token_summary["text_supervised_tokens"],
-                        "image_supervised_tokens": token_summary["image_supervised_tokens"],
-                        "text_token_ratio": token_summary["text_token_ratio"],
-                        "image_token_ratio": token_summary["image_token_ratio"],
-                        "partition_token_ratio": (
-                            float(supervised_token_count / max(1, token_summary["total_supervised_tokens"]))
-                            if supervised_token_count is not None and token_summary["total_supervised_tokens"] is not None
-                            else None
-                        ),
-                        "adapter_type": self._extract_adapter_type(name),
-                        "param_name": name,
-                        "layer_depth": self._extract_layer_depth(name),
-                        "grad_norm": float(grad_cpu.norm(p=2).item()),
-                        "grad_norm_per_token": (
-                            float(grad_cpu.norm(p=2).item() / max(1, supervised_token_count))
-                            if supervised_token_count is not None
-                            else None
-                        ),
-                        "grad_mean": float(grad_cpu.mean().item()),
-                        "grad_std": float(grad_cpu.std(unbiased=False).item()),
-                        "grad_abs_mean": float(grad_cpu.abs().mean().item()),
-                        "numel": int(grad_cpu.numel()),
-                        "grad_was_none": bool(grad_is_none),
-                        "grad_path": None,
-                    }
-                    if grad_idx in full_grad_dump_indices:
-                        record["grad_path"] = self._dump_full_grad_vector(
-                            step,
-                            grad_partition,
-                            name,
-                            grad_cpu,
-                        )
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            for grad_idx in adapter_grad_indices:
+                name, param = all_trainable_params[grad_idx]
+                grad = all_grads[grad_idx]
+                grad_is_none = grad is None
+                if grad_is_none:
+                    grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+                grad_cpu = grad.detach().float().cpu()
+                record = {
+                    "step": step,
+                    "example_index": -1,
+                    "modality_ids": modality_ids,
+                    "modality_type": "batch",
+                    "grad_partition": "all",
+                    "supervised_token_count": supervised_token_count,
+                    "total_supervised_tokens": token_summary["total_supervised_tokens"],
+                    "text_supervised_tokens": token_summary["text_supervised_tokens"],
+                    "image_supervised_tokens": token_summary["image_supervised_tokens"],
+                    "text_token_ratio": token_summary["text_token_ratio"],
+                    "image_token_ratio": token_summary["image_token_ratio"],
+                    "partition_token_ratio": 1.0 if supervised_token_count is not None else None,
+                    "adapter_type": self._extract_adapter_type(name),
+                    "param_name": name,
+                    "layer_depth": self._extract_layer_depth(name),
+                    "grad_norm": float(grad_cpu.norm(p=2).item()),
+                    "grad_norm_per_token": (
+                        float(grad_cpu.norm(p=2).item() / max(1, supervised_token_count))
+                        if supervised_token_count is not None
+                        else None
+                    ),
+                    "grad_mean": float(grad_cpu.mean().item()),
+                    "grad_std": float(grad_cpu.std(unbiased=False).item()),
+                    "grad_abs_mean": float(grad_cpu.abs().mean().item()),
+                    "numel": int(grad_cpu.numel()),
+                    "grad_was_none": bool(grad_is_none),
+                    "grad_path": None,
+                }
+                if grad_idx in full_grad_dump_indices:
+                    record["grad_path"] = self._dump_full_grad_vector(
+                        step,
+                        "all",
+                        name,
+                        grad_cpu,
+                    )
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def training_step(self, model, inputs, *args, **kwargs):
         if self._grad_logging_enabled:
