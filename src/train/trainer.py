@@ -1,4 +1,5 @@
 import json
+import numpy as np
 import os
 import re
 import torch
@@ -129,6 +130,30 @@ class QwenTrainer(Trainer):
         model_inputs.pop("video_grid_counts", None)
         return model_inputs
 
+    def _summarize_batch_modalities(self, modality_ids):
+        arr = np.array(modality_ids, dtype=np.int64) if len(modality_ids) > 0 else np.array([], dtype=np.int64)
+        text_only_examples = int((arr == 0).sum()) if arr.size > 0 else 0
+        image_examples = int((arr == 1).sum()) if arr.size > 0 else 0
+        video_examples = int((arr == 2).sum()) if arr.size > 0 else 0
+        has_text_only = text_only_examples > 0
+        has_vision = (image_examples + video_examples) > 0
+        if has_text_only and has_vision:
+            mix_type = "text_and_vision"
+        elif has_vision:
+            mix_type = "vision_only"
+        elif has_text_only:
+            mix_type = "text_only"
+        else:
+            mix_type = "unknown"
+        return {
+            "text_only_examples": text_only_examples,
+            "image_examples": image_examples,
+            "video_examples": video_examples,
+            "has_text_only": has_text_only,
+            "has_vision": has_vision,
+            "mix_type": mix_type,
+        }
+
     def _build_partitioned_inputs(self, single_inputs):
         labels = single_inputs.get("labels")
         token_modality_type = single_inputs.get("token_modality_type")
@@ -176,6 +201,7 @@ class QwenTrainer(Trainer):
                 modality_ids = modality_ids.detach().cpu().tolist()
             else:
                 modality_ids = []
+            batch_modality_summary = self._summarize_batch_modalities(modality_ids)
 
             for grad_partition, partition_inputs, supervised_token_count in self._build_partitioned_inputs(inputs):
                 loss = self.compute_loss(model, self._strip_auxiliary_inputs(partition_inputs))
@@ -199,6 +225,12 @@ class QwenTrainer(Trainer):
                         "example_index": -1,
                         "modality_ids": modality_ids,
                         "modality_type": "batch",
+                        "batch_mix_type": batch_modality_summary["mix_type"],
+                        "batch_has_text_only": bool(batch_modality_summary["has_text_only"]),
+                        "batch_has_vision": bool(batch_modality_summary["has_vision"]),
+                        "batch_text_only_examples": int(batch_modality_summary["text_only_examples"]),
+                        "batch_image_examples": int(batch_modality_summary["image_examples"]),
+                        "batch_video_examples": int(batch_modality_summary["video_examples"]),
                         "grad_partition": grad_partition,
                         "supervised_token_count": supervised_token_count,
                         "adapter_type": self._extract_adapter_type(name),
