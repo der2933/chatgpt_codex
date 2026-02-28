@@ -79,10 +79,6 @@ class TrainingArguments(HFTrainingArguments):
         default=False,
         metadata={"help": "Whether to dump full gradient vectors to .npy files for selected adapter parameters."},
     )
-    gradient_log_full_grad_max_params: int = field(
-        default=8,
-        metadata={"help": "Maximum number of adapter parameters per partition/step to dump full gradient vectors for. <=0 means all."},
-    )
     gradient_log_full_grad_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Directory to store dumped full gradient vectors (.npy). Defaults to output_dir/gradient_vectors."},
@@ -94,10 +90,6 @@ class TrainingArguments(HFTrainingArguments):
     hidden_state_log_every_n_steps: int = field(
         default=200,
         metadata={"help": "Log token hidden states every N training steps."},
-    )
-    hidden_state_log_max_tokens_per_modality: int = field(
-        default=64,
-        metadata={"help": "Maximum sampled tokens per modality (text/image) per layer when hidden-state logging is enabled."},
     )
     hidden_state_log_path: Optional[str] = field(
         default=None,

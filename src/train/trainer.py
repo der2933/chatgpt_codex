@@ -55,13 +55,11 @@ class QwenTrainer(Trainer):
         self._all_trainable_grad_params = None
         self._adapter_grad_indices = None
         self._grad_log_save_full_grad = bool(getattr(self.args, "gradient_log_save_full_grad", False))
-        self._grad_log_full_grad_max_params = int(getattr(self.args, "gradient_log_full_grad_max_params", 8))
         full_grad_dir = getattr(self.args, "gradient_log_full_grad_dir", None)
         self._grad_log_full_grad_dir = full_grad_dir or os.path.join(self.args.output_dir, "gradient_vectors")
 
         self._hidden_state_logging_enabled = bool(getattr(self.args, "enable_hidden_state_logging", False))
         self._hidden_state_log_every_n_steps = max(1, int(getattr(self.args, "hidden_state_log_every_n_steps", 200)))
-        self._hidden_state_log_max_tokens_per_modality = max(1, int(getattr(self.args, "hidden_state_log_max_tokens_per_modality", 64)))
         hidden_state_log_path = getattr(self.args, "hidden_state_log_path", None)
         self._hidden_state_log_path = hidden_state_log_path or os.path.join(self.args.output_dir, "hidden_state_logs.jsonl")
         hidden_state_vector_dir = getattr(self.args, "hidden_state_vector_dir", None)
@@ -180,21 +178,7 @@ class QwenTrainer(Trainer):
     def _select_full_grad_dump_indices(self, adapter_grad_indices, all_trainable_params, all_grads):
         if not self._grad_log_save_full_grad or len(adapter_grad_indices) == 0:
             return set()
-
-        scored = []
-        for grad_idx in adapter_grad_indices:
-            _, param = all_trainable_params[grad_idx]
-            grad = all_grads[grad_idx]
-            if grad is None:
-                norm_val = 0.0
-            else:
-                norm_val = float(grad.detach().float().norm(p=2).item())
-            scored.append((norm_val, grad_idx))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        if self._grad_log_full_grad_max_params <= 0:
-            return {idx for _, idx in scored}
-        return {idx for _, idx in scored[: self._grad_log_full_grad_max_params]}
+        return set(adapter_grad_indices)
 
     def _dump_full_grad_vector(self, step, grad_partition, param_name, grad_cpu):
         os.makedirs(self._grad_log_full_grad_dir, exist_ok=True)
