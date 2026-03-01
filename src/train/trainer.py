@@ -159,7 +159,7 @@ class QwenTrainer(Trainer):
             }
 
         ignore_index = self._get_ignore_index()
-        supervised_mask = labels.ne(ignore_index)
+        supervised_mask = ~labels.ne(ignore_index)
         image_mask = supervised_mask & token_modality_type.eq(1)
         text_mask = supervised_mask & token_modality_type.ne(1)
 
@@ -174,11 +174,6 @@ class QwenTrainer(Trainer):
             "text_token_ratio": float(text_tokens / denom),
             "image_token_ratio": float(image_tokens / denom),
         }
-
-    def _select_full_grad_dump_indices(self, adapter_grad_indices, all_trainable_params, all_grads):
-        if not self._grad_log_save_full_grad or len(adapter_grad_indices) == 0:
-            return set()
-        return set(adapter_grad_indices)
 
     def _dump_full_grad_vector(self, step, grad_partition, param_name, grad_cpu):
         os.makedirs(self._grad_log_full_grad_dir, exist_ok=True)
@@ -231,7 +226,7 @@ class QwenTrainer(Trainer):
 
         labels = model_inputs["labels"]
         token_modality_type = model_inputs["token_modality_type"]
-        supervised_mask = labels.ne(ignore_index)
+        supervised_mask = ~labels.ne(ignore_index)
         modality_ids = model_inputs.get("modality_type")
 
         batch_size = int(labels.size(0))
@@ -245,8 +240,8 @@ class QwenTrainer(Trainer):
                     sample_supervised = supervised_mask[sample_idx]
                     sample_token_modality = token_modality_type[sample_idx]
 
-                    sample_image_mask = sample_supervised & sample_token_modality.eq(1)
-                    sample_text_mask = sample_supervised & sample_token_modality.ne(1)
+                    sample_image_mask = (sample_supervised & sample_token_modality.eq(1)).cpu()
+                    sample_text_mask = (sample_supervised & sample_token_modality.ne(1)).cpu()
 
                     for modality, mask in (("image", sample_image_mask), ("text", sample_text_mask)):
                         token_count = int(mask.sum().item())
@@ -305,12 +300,6 @@ class QwenTrainer(Trainer):
                 create_graph=False,
                 allow_unused=True,
             )
-            full_grad_dump_indices = self._select_full_grad_dump_indices(
-                adapter_grad_indices,
-                all_trainable_params,
-                all_grads,
-            )
-
             for grad_idx in adapter_grad_indices:
                 name, param = all_trainable_params[grad_idx]
                 grad = all_grads[grad_idx]
@@ -347,10 +336,10 @@ class QwenTrainer(Trainer):
                     "grad_was_none": bool(grad_is_none),
                     "grad_path": None,
                 }
-                if grad_idx in full_grad_dump_indices:
+                if self._grad_log_save_full_grad:
                     record["grad_path"] = self._dump_full_grad_vector(
                         step,
-                        "all",
+                        "all" if token_summary["image_token_ratio"] != 0.0 else "text_only",
                         name,
                         grad_cpu,
                     )
