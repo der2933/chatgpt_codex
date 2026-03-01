@@ -1,5 +1,8 @@
+import hashlib
 import json
+import numpy as np
 import os
+import re
 import torch
 import torch.nn as nn
 
@@ -38,9 +41,462 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     return param
 
 
+
+
 class QwenTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super(QwenTrainer, self).__init__(*args, **kwargs)
+        self._grad_logging_enabled = bool(getattr(self.args, "enable_gradient_logging", False))
+        self._grad_log_every_n_steps = max(1, int(getattr(self.args, "gradient_log_every_n_steps", 50)))
+        self._grad_log_max_examples_per_step = max(1, int(getattr(self.args, "gradient_log_max_examples_per_step", 1)))
+        grad_log_path = getattr(self.args, "gradient_log_path", None)
+        self._grad_log_path = grad_log_path or os.path.join(self.args.output_dir, "gradient_logs.jsonl")
+        self._adapter_grad_params = None
+        self._all_trainable_grad_params = None
+        self._adapter_grad_indices = None
+        self._grad_log_save_full_grad = bool(getattr(self.args, "gradient_log_save_full_grad", False))
+        full_grad_dir = getattr(self.args, "gradient_log_full_grad_dir", None)
+        self._grad_log_full_grad_dir = full_grad_dir or os.path.join(self.args.output_dir, "gradient_vectors")
+
+        self._hidden_state_logging_enabled = bool(getattr(self.args, "enable_hidden_state_logging", False))
+        self._hidden_state_log_every_n_steps = max(1, int(getattr(self.args, "hidden_state_log_every_n_steps", 200)))
+        hidden_state_log_path = getattr(self.args, "hidden_state_log_path", None)
+        self._hidden_state_log_path = hidden_state_log_path or os.path.join(self.args.output_dir, "hidden_state_logs.jsonl")
+        hidden_state_vector_dir = getattr(self.args, "hidden_state_vector_dir", None)
+        self._hidden_state_vector_dir = hidden_state_vector_dir or os.path.join(self.args.output_dir, "hidden_state_vectors")
+
+        self._expert_routing_logging_enabled = bool(getattr(self.args, "enable_expert_routing_logging", False))
+        self._expert_routing_log_every_n_steps = max(1, int(getattr(self.args, "expert_routing_log_every_n_steps", 200)))
+        expert_routing_log_path = getattr(self.args, "expert_routing_log_path", None)
+        self._expert_routing_log_path = expert_routing_log_path or os.path.join(self.args.output_dir, "expert_routing_logs.jsonl")
+        expert_routing_vector_dir = getattr(self.args, "expert_routing_vector_dir", None)
+        self._expert_routing_vector_dir = expert_routing_vector_dir or os.path.join(self.args.output_dir, "expert_routing_vectors")
+
+    def _is_transformer_block_adapter_param(self, name: str) -> bool:
+        if "model.layers." not in name:
+            return False
+        adapter_keywords = ("custom_lora", "lora_", "adapter", "kradapter")
+        return any(keyword in name.lower() for keyword in adapter_keywords)
+
+    def _extract_layer_depth(self, name: str) -> int:
+        match = re.search(r"model\.layers\.(\d+)", name)
+        return int(match.group(1)) if match else -1
+
+    def _extract_adapter_type(self, name: str) -> str:
+        lower_name = name.lower()
+        if "custom_lora" in lower_name:
+            return "custom_lora"
+        if "kradapter" in lower_name:
+            return "kradapter"
+        if "lora_a" in lower_name:
+            return "lora_A"
+        if "lora_b" in lower_name:
+            return "lora_B"
+        if "adapter" in lower_name:
+            return "adapter"
+        return "other"
+
+    def _get_adapter_grad_params(self):
+        if self._adapter_grad_params is not None:
+            return self._adapter_grad_params
+        self._adapter_grad_params = [
+            (name, param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and self._is_transformer_block_adapter_param(name)
+        ]
+        if self._grad_logging_enabled and self.is_world_process_zero():
+            logger.info(
+                f"Gradient logging enabled. Tracking {len(self._adapter_grad_params)} transformer-block adapter parameters."
+            )
+        return self._adapter_grad_params
+
+    def _get_all_trainable_grad_params(self):
+        if self._all_trainable_grad_params is not None:
+            return self._all_trainable_grad_params
+        self._all_trainable_grad_params = [
+            (name, param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        ]
+        return self._all_trainable_grad_params
+
+    def _get_adapter_grad_indices(self):
+        if self._adapter_grad_indices is not None:
+            return self._adapter_grad_indices
+
+        all_params = self._get_all_trainable_grad_params()
+        adapter_param_ids = {id(param) for _, param in self._get_adapter_grad_params()}
+        self._adapter_grad_indices = [
+            idx
+            for idx, (_, param) in enumerate(all_params)
+            if id(param) in adapter_param_ids
+        ]
+        return self._adapter_grad_indices
+
+    def _should_log_gradients(self) -> bool:
+        if not self._grad_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._grad_log_every_n_steps == 0
+
+    def _strip_auxiliary_inputs(self, inputs):
+        model_inputs = dict(inputs)
+        model_inputs.pop("modality_type", None)
+        model_inputs.pop("image_grid_counts", None)
+        model_inputs.pop("video_grid_counts", None)
+        return model_inputs
+
+    def _get_ignore_index(self) -> int:
+        if self.label_smoother is not None and hasattr(self.label_smoother, "ignore_index"):
+            return int(self.label_smoother.ignore_index)
+        return -100
+
+    def _summarize_supervised_tokens(self, inputs):
+        labels = inputs.get("labels")
+        token_modality_type = inputs.get("token_modality_type")
+        if not isinstance(labels, torch.Tensor) or not isinstance(token_modality_type, torch.Tensor):
+            return {
+                "total_supervised_tokens": None,
+                "text_supervised_tokens": None,
+                "image_supervised_tokens": None,
+                "text_token_ratio": None,
+                "image_token_ratio": None,
+            }
+
+        ignore_index = self._get_ignore_index()
+        supervised_mask = labels.ne(ignore_index)
+        image_mask = supervised_mask & token_modality_type.eq(1)
+        text_mask = supervised_mask & token_modality_type.ne(1)
+
+        total_tokens = int(supervised_mask.sum().item())
+        text_tokens = int(text_mask.sum().item())
+        image_tokens = int(image_mask.sum().item())
+        denom = max(1, total_tokens)
+        return {
+            "total_supervised_tokens": total_tokens,
+            "text_supervised_tokens": text_tokens,
+            "image_supervised_tokens": image_tokens,
+            "text_token_ratio": float(text_tokens / denom),
+            "image_token_ratio": float(image_tokens / denom),
+        }
+
+    def _dump_full_grad_vector(self, step, grad_partition, param_name, grad_cpu):
+        os.makedirs(self._grad_log_full_grad_dir, exist_ok=True)
+        safe_name = hashlib.md5(param_name.encode("utf-8")).hexdigest()[:16]
+        filename = f"step{step:08d}_{grad_partition}_{safe_name}.npy"
+        path = os.path.join(self._grad_log_full_grad_dir, filename)
+        np.save(path, grad_cpu.numpy())
+        return path
+
+    def _should_log_hidden_states(self) -> bool:
+        if not self._hidden_state_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._hidden_state_log_every_n_steps == 0
+
+    def _dump_hidden_vectors(self, step, layer_depth, sample_idx, modality, vector):
+        os.makedirs(self._hidden_state_vector_dir, exist_ok=True)
+        file_name = f"step{step:08d}_layer{layer_depth:03d}_sample{sample_idx:04d}_{modality}.npy"
+        path = os.path.join(self._hidden_state_vector_dir, file_name)
+        np.save(path, vector)
+        return path
+
+    def _log_token_hidden_states(self, model, inputs):
+        if not self._should_log_hidden_states():
+            return
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        if "token_modality_type" not in model_inputs or "labels" not in model_inputs:
+            return
+
+        hs_log_dir = os.path.dirname(self._hidden_state_log_path)
+        if hs_log_dir:
+            os.makedirs(hs_log_dir, exist_ok=True)
+
+        step = int(self.state.global_step + 1)
+        ignore_index = self._get_ignore_index()
+
+        with torch.no_grad():
+            outputs = model(
+                **model_inputs,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            return
+
+        labels = model_inputs["labels"]
+        token_modality_type = model_inputs["token_modality_type"]
+        supervised_mask = labels.ne(ignore_index)
+        modality_ids = model_inputs.get("modality_type")
+
+        batch_size = int(labels.size(0))
+        with open(self._hidden_state_log_path, "a", encoding="utf-8") as f:
+            for layer_idx, layer_hidden in enumerate(hidden_states[1:]):
+                layer_depth = layer_idx
+                layer_hidden = layer_hidden.detach().float().cpu()
+
+                for sample_idx in range(batch_size):
+                    sample_hidden = layer_hidden[sample_idx]
+                    sample_supervised = supervised_mask[sample_idx]
+                    sample_token_modality = token_modality_type[sample_idx]
+
+                    sample_image_mask = (sample_supervised & sample_token_modality.eq(1)).cpu()
+                    sample_text_mask = (sample_supervised & sample_token_modality.ne(1)).cpu()
+
+                    for modality, mask in (("image", sample_image_mask), ("text", sample_text_mask)):
+                        token_count = int(mask.sum().item())
+                        if token_count == 0:
+                            continue
+
+                        vectors = sample_hidden[mask]
+                        mean_vector = vectors.mean(dim=0)
+                        vec_np = mean_vector.numpy()
+                        vec_path = self._dump_hidden_vectors(step, layer_depth, sample_idx, modality, vec_np)
+                        record = {
+                            "step": step,
+                            "layer_depth": int(layer_depth),
+                            "sample_index": int(sample_idx),
+                            "sample_modality_type": (
+                                int(modality_ids[sample_idx].item())
+                                if isinstance(modality_ids, torch.Tensor)
+                                else None
+                            ),
+                            "modality": modality,
+                            "token_count": token_count,
+                            "hidden_dim": int(vec_np.shape[0]),
+                            "hidden_path": vec_path,
+                            "hidden_norm": float(np.linalg.norm(vec_np)),
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _should_log_expert_routing(self) -> bool:
+        if not self._expert_routing_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._expert_routing_log_every_n_steps == 0
+
+    def _extract_routing_tensors(self, outputs):
+        candidates = []
+
+        def _append_if_valid(x):
+            if isinstance(x, torch.Tensor) and x.dim() >= 2:
+                candidates.append(x)
+            elif isinstance(x, (list, tuple)):
+                for item in x:
+                    if isinstance(item, torch.Tensor) and item.dim() >= 2:
+                        candidates.append(item)
+
+        if isinstance(outputs, dict):
+            for key in [
+                "router_logits",
+                "router_probs",
+                "gating_scores",
+                "expert_weights",
+                "moe_router_logits",
+                "moe_gating_scores",
+            ]:
+                if key in outputs:
+                    _append_if_valid(outputs[key])
+        else:
+            for key in [
+                "router_logits",
+                "router_probs",
+                "gating_scores",
+                "expert_weights",
+                "moe_router_logits",
+                "moe_gating_scores",
+            ]:
+                if hasattr(outputs, key):
+                    _append_if_valid(getattr(outputs, key))
+
+        return candidates
+
+    def _dump_routing_vector(self, step, layer_depth, modality, vec):
+        os.makedirs(self._expert_routing_vector_dir, exist_ok=True)
+        file_name = f"step{step:08d}_layer{layer_depth:03d}_{modality}.npy"
+        path = os.path.join(self._expert_routing_vector_dir, file_name)
+        np.save(path, vec)
+        return path
+
+    def _log_expert_routing(self, model, inputs):
+        if not self._should_log_expert_routing():
+            return
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        if "token_modality_type" not in model_inputs or "labels" not in model_inputs:
+            return
+
+        log_dir = os.path.dirname(self._expert_routing_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        step = int(self.state.global_step + 1)
+        ignore_index = self._get_ignore_index()
+
+        with torch.no_grad():
+            try:
+                outputs = model(
+                    **model_inputs,
+                    output_router_logits=True,
+                    return_dict=True,
+                )
+            except TypeError:
+                outputs = model(
+                    **model_inputs,
+                    return_dict=True,
+                )
+
+        routing_tensors = self._extract_routing_tensors(outputs)
+        if len(routing_tensors) == 0:
+            return
+
+        labels = model_inputs["labels"]
+        token_modality_type = model_inputs["token_modality_type"]
+        supervised_mask = labels.ne(ignore_index)
+        text_mask = (supervised_mask & token_modality_type.ne(1)).reshape(-1).cpu()
+        image_mask = (supervised_mask & token_modality_type.eq(1)).reshape(-1).cpu()
+
+        with open(self._expert_routing_log_path, "a", encoding="utf-8") as f:
+            for layer_depth, rt in enumerate(routing_tensors):
+                rt = rt.detach().float().cpu()
+                num_experts = int(rt.size(-1))
+                rt2 = rt.reshape(-1, num_experts)
+
+                for modality, mask in (("text", text_mask), ("image", image_mask)):
+                    if mask.numel() != rt2.size(0):
+                        min_len = min(mask.numel(), rt2.size(0))
+                        mask_use = mask[:min_len]
+                        val = rt2[:min_len]
+                    else:
+                        mask_use = mask
+                        val = rt2
+
+                    if int(mask_use.sum().item()) == 0:
+                        continue
+
+                    selected = val[mask_use]
+                    probs = torch.softmax(selected, dim=-1)
+                    mean_activation = probs.mean(dim=0).numpy()
+                    entropy = float((-(probs * torch.log(probs + 1e-12)).sum(dim=-1)).mean().item())
+                    top1 = probs.argmax(dim=-1)
+                    top1_hist = torch.bincount(top1, minlength=num_experts).float()
+                    top1_hist = (top1_hist / top1_hist.sum().clamp_min(1.0)).numpy()
+
+                    vec_path = self._dump_routing_vector(step, layer_depth, modality, mean_activation)
+                    hist_path = self._dump_routing_vector(step, layer_depth, f"{modality}_top1hist", top1_hist)
+
+                    rec = {
+                        "step": step,
+                        "layer_depth": int(layer_depth),
+                        "modality": modality,
+                        "num_tokens": int(selected.size(0)),
+                        "num_experts": num_experts,
+                        "routing_entropy": entropy,
+                        "routing_mean_path": vec_path,
+                        "routing_top1_hist_path": hist_path,
+                        "routing_mean_max": float(mean_activation.max()),
+                        "routing_mean_min": float(mean_activation.min()),
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _log_example_level_gradients(self, model, inputs):
+        if not self._should_log_gradients():
+            return
+
+        all_trainable_params = self._get_all_trainable_grad_params()
+        adapter_grad_indices = self._get_adapter_grad_indices()
+        if len(adapter_grad_indices) == 0:
+            return
+
+        step = int(self.state.global_step + 1)
+
+        grad_log_dir = os.path.dirname(self._grad_log_path)
+        if grad_log_dir:
+            os.makedirs(grad_log_dir, exist_ok=True)
+        with open(self._grad_log_path, "a", encoding="utf-8") as f:
+            modality_ids = inputs.get("modality_type")
+            if isinstance(modality_ids, torch.Tensor):
+                modality_ids = modality_ids.detach().cpu().tolist()
+            else:
+                modality_ids = []
+            token_summary = self._summarize_supervised_tokens(inputs)
+
+            supervised_token_count = token_summary["total_supervised_tokens"]
+            loss = self.compute_loss(model, self._strip_auxiliary_inputs(inputs))
+            all_grads = torch.autograd.grad(
+                loss,
+                [param for _, param in all_trainable_params],
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for grad_idx in adapter_grad_indices:
+                name, param = all_trainable_params[grad_idx]
+                grad = all_grads[grad_idx]
+                grad_is_none = grad is None
+                if grad_is_none:
+                    grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+                grad_cpu = grad.detach().float().cpu()
+                record = {
+                    "step": step,
+                    "example_index": -1,
+                    "modality_ids": modality_ids,
+                    "modality_type": "batch",
+                    "grad_partition": "all",
+                    "supervised_token_count": supervised_token_count,
+                    "total_supervised_tokens": token_summary["total_supervised_tokens"],
+                    "text_supervised_tokens": token_summary["text_supervised_tokens"],
+                    "image_supervised_tokens": token_summary["image_supervised_tokens"],
+                    "text_token_ratio": token_summary["text_token_ratio"],
+                    "image_token_ratio": token_summary["image_token_ratio"],
+                    "partition_token_ratio": 1.0 if supervised_token_count is not None else None,
+                    "adapter_type": self._extract_adapter_type(name),
+                    "param_name": name,
+                    "layer_depth": self._extract_layer_depth(name),
+                    "grad_norm": float(grad_cpu.norm(p=2).item()),
+                    "grad_norm_per_token": (
+                        float(grad_cpu.norm(p=2).item() / max(1, supervised_token_count))
+                        if supervised_token_count is not None
+                        else None
+                    ),
+                    "grad_mean": float(grad_cpu.mean().item()),
+                    "grad_std": float(grad_cpu.std(unbiased=False).item()),
+                    "grad_abs_mean": float(grad_cpu.abs().mean().item()),
+                    "numel": int(grad_cpu.numel()),
+                    "grad_was_none": bool(grad_is_none),
+                    "grad_path": None,
+                }
+                if self._grad_log_save_full_grad:
+                    record["grad_path"] = self._dump_full_grad_vector(
+                        step,
+                        "all" if token_summary["image_token_ratio"] != 0.0 else "text_only",
+                        name,
+                        grad_cpu,
+                    )
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        if self._grad_logging_enabled:
+            with torch.enable_grad():
+                self._log_example_level_gradients(model, inputs)
+
+        if self._hidden_state_logging_enabled:
+            self._log_token_hidden_states(model, inputs)
+
+        if self._expert_routing_logging_enabled:
+            self._log_expert_routing(model, inputs)
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        return super().training_step(model, model_inputs, *args, **kwargs)
 
     def create_optimizer(self):
         """

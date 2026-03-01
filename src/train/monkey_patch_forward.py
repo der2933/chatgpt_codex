@@ -344,6 +344,7 @@ def qwen2_5_mixed_modality_forward_with_flce(
     cache_position: Optional[torch.LongTensor] = None,
     second_per_grid_ts: Optional[torch.Tensor] = None,
     token_modality_type: Optional[torch.Tensor] = None,
+    output_router_logits: Optional[bool] = False,
 ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -445,7 +446,8 @@ def qwen2_5_mixed_modality_forward_with_flce(
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
         cache_position=cache_position,
-        token_modality_type=token_modality_type
+        token_modality_type=token_modality_type,
+        output_router_logits=output_router_logits,
     )
 
     hidden_states = outputs[0]
@@ -486,6 +488,8 @@ def qwen2_5_mixed_modality_forward_with_flce(
 
     if not return_dict:
         output = (logits,) + outputs[1:]
+        if output_router_logits:
+            output = output + (getattr(outputs, "router_logits", None),)
         return (loss,) + output if loss is not None else output
 
     return Qwen2_5_VLCausalLMOutputWithPast(
@@ -495,6 +499,7 @@ def qwen2_5_mixed_modality_forward_with_flce(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=self.rope_deltas,
+        router_logits=getattr(outputs, "router_logits", None),
     )
 
 
@@ -519,6 +524,8 @@ def qwen2_5_mixed_modality_forward(
     rope_deltas: Optional[torch.LongTensor] = None,
     cache_position: Optional[torch.LongTensor] = None,
     second_per_grid_ts: Optional[torch.Tensor] = None,
+    token_modality_type: Optional[torch.Tensor] = None,
+    output_router_logits: Optional[bool] = False,
 ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -620,6 +627,8 @@ def qwen2_5_mixed_modality_forward(
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
         cache_position=cache_position,
+        token_modality_type=token_modality_type,
+        output_router_logits=output_router_logits,
     )
 
     hidden_states = outputs[0]
@@ -643,6 +652,8 @@ def qwen2_5_mixed_modality_forward(
 
     if not return_dict:
         output = (logits,) + outputs[1:]
+        if output_router_logits:
+            output = output + (getattr(outputs, "router_logits", None),)
         return (loss,) + output if loss is not None else output
 
     return Qwen2_5_VLCausalLMOutputWithPast(
@@ -652,4 +663,5 @@ def qwen2_5_mixed_modality_forward(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=self.rope_deltas,
+        router_logits=getattr(outputs, "router_logits", None),
     )

@@ -59,6 +59,62 @@ class TrainingArguments(HFTrainingArguments):
     num_lora_modules: int = -1
     use_liger: bool = True
     do_final_eval: bool = False
+    enable_gradient_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable example-level gradient logging for transformer block adapters."},
+    )
+    gradient_log_every_n_steps: int = field(
+        default=50,
+        metadata={"help": "Log gradients every N training steps."},
+    )
+    gradient_log_max_examples_per_step: int = field(
+        default=1,
+        metadata={"help": "Maximum number of examples logged per selected step."},
+    )
+    gradient_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write gradient jsonl records. Defaults to output_dir/gradient_logs.jsonl."},
+    )
+    gradient_log_save_full_grad: bool = field(
+        default=False,
+        metadata={"help": "Whether to dump full gradient vectors to .npy files for selected adapter parameters."},
+    )
+    gradient_log_full_grad_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store dumped full gradient vectors (.npy). Defaults to output_dir/gradient_vectors."},
+    )
+    enable_hidden_state_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable token hidden-state logging by layer for modality-space analysis."},
+    )
+    hidden_state_log_every_n_steps: int = field(
+        default=200,
+        metadata={"help": "Log token hidden states every N training steps."},
+    )
+    hidden_state_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write hidden-state jsonl records. Defaults to output_dir/hidden_state_logs.jsonl."},
+    )
+    hidden_state_vector_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store hidden-state token vectors (.npy). Defaults to output_dir/hidden_state_vectors."},
+    )
+    enable_expert_routing_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable expert routing/gating logging for MoE-style adapters (MAMoE/MoELoRA)."},
+    )
+    expert_routing_log_every_n_steps: int = field(
+        default=200,
+        metadata={"help": "Log expert routing statistics every N training steps."},
+    )
+    expert_routing_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write expert routing jsonl records. Defaults to output_dir/expert_routing_logs.jsonl."},
+    )
+    expert_routing_vector_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store routing vectors (.npy). Defaults to output_dir/expert_routing_vectors."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

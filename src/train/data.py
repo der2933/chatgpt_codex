@@ -433,19 +433,35 @@ class DataCollatorForSupervisedDataset(object):
         batch_image_thw = []
         batch_second_per_grid_ts = []
         batch_token_modality_type = []
-        
+        batch_modality_type = []
+        batch_image_grid_counts = []
+        batch_video_grid_counts = []
+
         for example in examples:
             keys = example.keys()
+            has_video = False
+            has_image = False
             if "pixel_values_videos" in keys:
                 batch_pixel_video_values.append(example["pixel_values_videos"])
                 batch_video_thw.append(example["video_grid_thw"])
+                batch_video_grid_counts.append(int(example["video_grid_thw"].size(0)))
+                batch_image_grid_counts.append(0)
+                has_video = True
             elif "pixel_values" in keys:
                 batch_pixel_values.append(example["pixel_values"])
                 batch_image_thw.append(example["image_grid_thw"])
-            
+                batch_image_grid_counts.append(int(example["image_grid_thw"].size(0)))
+                batch_video_grid_counts.append(0)
+                has_image = True
+            else:
+                batch_image_grid_counts.append(0)
+                batch_video_grid_counts.append(0)
+
             batch_input_ids.append(example["input_ids"])
             batch_label_ids.append(example["labels"])
             batch_token_modality_type.append((example["input_ids"] == self.image_token_id).long())
+            modality_type = 2 if has_video else (1 if has_image else 0)
+            batch_modality_type.append(modality_type)
 
             if "second_per_grid_ts" in keys:
                 batch_second_per_grid_ts.extend(example["second_per_grid_ts"])
@@ -463,6 +479,9 @@ class DataCollatorForSupervisedDataset(object):
             'labels': labels,
             'attention_mask': attention_mask,
             'token_modality_type': token_modality_type,
+            'modality_type': torch.tensor(batch_modality_type, dtype=torch.long),
+            'image_grid_counts': torch.tensor(batch_image_grid_counts, dtype=torch.long),
+            'video_grid_counts': torch.tensor(batch_video_grid_counts, dtype=torch.long),
         }
 
         if len(batch_pixel_values) > 0:
