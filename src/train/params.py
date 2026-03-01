@@ -99,6 +99,22 @@ class TrainingArguments(HFTrainingArguments):
         default=None,
         metadata={"help": "Directory to store hidden-state token vectors (.npy). Defaults to output_dir/hidden_state_vectors."},
     )
+    enable_expert_routing_logging: bool = field(
+        default=False,
+        metadata={"help": "Enable expert routing/gating logging for MoE-style adapters (MAMoE/MoELoRA)."},
+    )
+    expert_routing_log_every_n_steps: int = field(
+        default=200,
+        metadata={"help": "Log expert routing statistics every N training steps."},
+    )
+    expert_routing_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to write expert routing jsonl records. Defaults to output_dir/expert_routing_logs.jsonl."},
+    )
+    expert_routing_vector_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to store routing vectors (.npy). Defaults to output_dir/expert_routing_vectors."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

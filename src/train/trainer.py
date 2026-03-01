@@ -65,6 +65,13 @@ class QwenTrainer(Trainer):
         hidden_state_vector_dir = getattr(self.args, "hidden_state_vector_dir", None)
         self._hidden_state_vector_dir = hidden_state_vector_dir or os.path.join(self.args.output_dir, "hidden_state_vectors")
 
+        self._expert_routing_logging_enabled = bool(getattr(self.args, "enable_expert_routing_logging", False))
+        self._expert_routing_log_every_n_steps = max(1, int(getattr(self.args, "expert_routing_log_every_n_steps", 200)))
+        expert_routing_log_path = getattr(self.args, "expert_routing_log_path", None)
+        self._expert_routing_log_path = expert_routing_log_path or os.path.join(self.args.output_dir, "expert_routing_logs.jsonl")
+        expert_routing_vector_dir = getattr(self.args, "expert_routing_vector_dir", None)
+        self._expert_routing_vector_dir = expert_routing_vector_dir or os.path.join(self.args.output_dir, "expert_routing_vectors")
+
     def _is_transformer_block_adapter_param(self, name: str) -> bool:
         if "model.layers." not in name:
             return False
@@ -159,7 +166,7 @@ class QwenTrainer(Trainer):
             }
 
         ignore_index = self._get_ignore_index()
-        supervised_mask = ~labels.ne(ignore_index)
+        supervised_mask = labels.ne(ignore_index)
         image_mask = supervised_mask & token_modality_type.eq(1)
         text_mask = supervised_mask & token_modality_type.ne(1)
 
@@ -226,7 +233,7 @@ class QwenTrainer(Trainer):
 
         labels = model_inputs["labels"]
         token_modality_type = model_inputs["token_modality_type"]
-        supervised_mask = ~labels.ne(ignore_index)
+        supervised_mask = labels.ne(ignore_index)
         modality_ids = model_inputs.get("modality_type")
 
         batch_size = int(labels.size(0))
@@ -268,6 +275,138 @@ class QwenTrainer(Trainer):
                             "hidden_norm": float(np.linalg.norm(vec_np)),
                         }
                         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _should_log_expert_routing(self) -> bool:
+        if not self._expert_routing_logging_enabled:
+            return False
+        if not self.is_world_process_zero():
+            return False
+        next_step = self.state.global_step + 1
+        return next_step % self._expert_routing_log_every_n_steps == 0
+
+    def _extract_routing_tensors(self, outputs):
+        candidates = []
+
+        def _append_if_valid(x):
+            if isinstance(x, torch.Tensor) and x.dim() >= 2:
+                candidates.append(x)
+            elif isinstance(x, (list, tuple)):
+                for item in x:
+                    if isinstance(item, torch.Tensor) and item.dim() >= 2:
+                        candidates.append(item)
+
+        if isinstance(outputs, dict):
+            for key in [
+                "router_logits",
+                "router_probs",
+                "gating_scores",
+                "expert_weights",
+                "moe_router_logits",
+                "moe_gating_scores",
+            ]:
+                if key in outputs:
+                    _append_if_valid(outputs[key])
+        else:
+            for key in [
+                "router_logits",
+                "router_probs",
+                "gating_scores",
+                "expert_weights",
+                "moe_router_logits",
+                "moe_gating_scores",
+            ]:
+                if hasattr(outputs, key):
+                    _append_if_valid(getattr(outputs, key))
+
+        return candidates
+
+    def _dump_routing_vector(self, step, layer_depth, modality, vec):
+        os.makedirs(self._expert_routing_vector_dir, exist_ok=True)
+        file_name = f"step{step:08d}_layer{layer_depth:03d}_{modality}.npy"
+        path = os.path.join(self._expert_routing_vector_dir, file_name)
+        np.save(path, vec)
+        return path
+
+    def _log_expert_routing(self, model, inputs):
+        if not self._should_log_expert_routing():
+            return
+
+        model_inputs = self._strip_auxiliary_inputs(inputs)
+        if "token_modality_type" not in model_inputs or "labels" not in model_inputs:
+            return
+
+        log_dir = os.path.dirname(self._expert_routing_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        step = int(self.state.global_step + 1)
+        ignore_index = self._get_ignore_index()
+
+        with torch.no_grad():
+            try:
+                outputs = model(
+                    **model_inputs,
+                    output_router_logits=True,
+                    return_dict=True,
+                )
+            except TypeError:
+                outputs = model(
+                    **model_inputs,
+                    return_dict=True,
+                )
+
+        routing_tensors = self._extract_routing_tensors(outputs)
+        if len(routing_tensors) == 0:
+            return
+
+        labels = model_inputs["labels"]
+        token_modality_type = model_inputs["token_modality_type"]
+        supervised_mask = labels.ne(ignore_index)
+        text_mask = (supervised_mask & token_modality_type.ne(1)).reshape(-1).cpu()
+        image_mask = (supervised_mask & token_modality_type.eq(1)).reshape(-1).cpu()
+
+        with open(self._expert_routing_log_path, "a", encoding="utf-8") as f:
+            for layer_depth, rt in enumerate(routing_tensors):
+                rt = rt.detach().float().cpu()
+                num_experts = int(rt.size(-1))
+                rt2 = rt.reshape(-1, num_experts)
+
+                for modality, mask in (("text", text_mask), ("image", image_mask)):
+                    if mask.numel() != rt2.size(0):
+                        min_len = min(mask.numel(), rt2.size(0))
+                        mask_use = mask[:min_len]
+                        val = rt2[:min_len]
+                    else:
+                        mask_use = mask
+                        val = rt2
+
+                    if int(mask_use.sum().item()) == 0:
+                        continue
+
+                    selected = val[mask_use]
+                    probs = torch.softmax(selected, dim=-1)
+                    mean_activation = probs.mean(dim=0).numpy()
+                    entropy = float((-(probs * torch.log(probs + 1e-12)).sum(dim=-1)).mean().item())
+                    top1 = probs.argmax(dim=-1)
+                    top1_hist = torch.bincount(top1, minlength=num_experts).float()
+                    top1_hist = (top1_hist / top1_hist.sum().clamp_min(1.0)).numpy()
+
+                    vec_path = self._dump_routing_vector(step, layer_depth, modality, mean_activation)
+                    hist_path = self._dump_routing_vector(step, layer_depth, f"{modality}_top1hist", top1_hist)
+
+                    rec = {
+                        "step": step,
+                        "layer_depth": int(layer_depth),
+                        "modality": modality,
+                        "num_tokens": int(selected.size(0)),
+                        "num_experts": num_experts,
+                        "routing_entropy": entropy,
+                        "routing_mean_path": vec_path,
+                        "routing_top1_hist_path": hist_path,
+                        "routing_mean_max": float(mean_activation.max()),
+                        "routing_mean_min": float(mean_activation.min()),
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def _log_example_level_gradients(self, model, inputs):
         if not self._should_log_gradients():
@@ -352,6 +491,9 @@ class QwenTrainer(Trainer):
 
         if self._hidden_state_logging_enabled:
             self._log_token_hidden_states(model, inputs)
+
+        if self._expert_routing_logging_enabled:
+            self._log_expert_routing(model, inputs)
 
         model_inputs = self._strip_auxiliary_inputs(inputs)
         return super().training_step(model, model_inputs, *args, **kwargs)
