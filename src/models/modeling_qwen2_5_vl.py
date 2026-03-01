@@ -81,6 +81,17 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
 
 
+def _dense_router_scores(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    num_experts: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    dense = weights.new_zeros((num_tokens, num_experts))
+    dense.scatter_(1, indices, weights)
+    return dense
+
+
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
@@ -1352,6 +1363,9 @@ class MAMoELoRA(nn.Module):
 
         # # 3. Modality-shared experts
         weights, indices = self.modality_gates[self.num_modality](modality_aware_x, static_feat_flat)
+        self.latest_router_logits = _dense_router_scores(
+            weights, indices, self.n_routed_experts, x_flat.size(0)
+        ).view(B, T, self.n_routed_experts)
         for i in range(self.n_routed_experts):
             sel = (indices == i)
             idx, top = torch.where(sel)
@@ -1590,6 +1604,9 @@ class MoELoRA(nn.Module):
         shape = x.size()
         x = x.view(-1, self.hidden_size)
         weights, indices = self.gate(x, token_modality_type)
+        self.latest_router_logits = _dense_router_scores(
+            weights, indices, self.n_routed_experts, x.size(0)
+        ).view(shape[0], shape[1], self.n_routed_experts)
 
         y = torch.zeros_like(x)
         counts = torch.bincount(
@@ -1941,6 +1958,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         token_modality_type: Optional[torch.LongTensor] = None,
+        output_router_logits: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -1991,10 +2009,12 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # MoE LoRA
+        router_logits = None
         if hasattr(self, "custom_lora"):# and hasattr(self, "lora_layernorm"):
             residual = hidden_states
             hidden_states = self.lora_layernorm(hidden_states)
             hidden_states = self.custom_lora(hidden_states, token_modality_type)
+            router_logits = getattr(self.custom_lora, "latest_router_logits", None)
             hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -2004,6 +2024,9 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        if output_router_logits:
+            outputs += (router_logits,)
 
         return outputs
 
@@ -2054,6 +2077,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         token_modality_type: Optional[torch.LongTensor] = None,
+        output_router_logits: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -2124,6 +2148,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
@@ -2142,6 +2167,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position,
                     position_embeddings,
                     token_modality_type,
+                    output_router_logits,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -2154,9 +2180,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     token_modality_type=token_modality_type,
+                    output_router_logits=output_router_logits,
                 )
 
             hidden_states = layer_outputs[0]
+
+            if output_router_logits:
+                all_router_logits += (layer_outputs[-1],)
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -2175,16 +2205,19 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
                 if v is not None
             )
 
-        return BaseModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns
         )
+        if output_router_logits:
+            output["router_logits"] = all_router_logits
+        return output
     
     def _update_causal_mask(
         self,
@@ -2384,6 +2417,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
             heads.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
+        router_logits (`tuple(torch.FloatTensor)`, *optional*):
+            Per-layer dense expert routing scores with shape `(batch_size, sequence_length, num_experts)` when requested.
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -2392,6 +2427,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    router_logits: Optional[Tuple[torch.FloatTensor]] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -2780,6 +2816,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         token_modality_type: Optional[torch.Tensor] = None,
+        output_router_logits: Optional[bool] = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2925,6 +2962,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             return_dict=return_dict,
             cache_position=cache_position,
             token_modality_type=token_modality_type,
+            output_router_logits=output_router_logits,
         )
 
         hidden_states = outputs[0]
@@ -2948,6 +2986,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         if not return_dict:
             output = (logits,) + outputs[1:]
+            if output_router_logits:
+                output = output + (getattr(outputs, "router_logits", None),)
             return (loss,) + output if loss is not None else output
 
         return Qwen2_5_VLCausalLMOutputWithPast(
@@ -2957,6 +2997,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
+            router_logits=getattr(outputs, "router_logits", None),
         )
 
     def prepare_inputs_for_generation(
